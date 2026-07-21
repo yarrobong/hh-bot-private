@@ -1,0 +1,45 @@
+ekb|noExperience|Python стажер
+ekb|between1And3|Python разработчик
+ekb|between1And3|Python Django
+ekb|noExperience|Junior Python
+ekb|between1And3|Junior Python Developer
+ekb|noExperience|Backend Python стажер
+ekb|between1And3|Backend Python
+ekb|between1And3|Python API
+ekb|between1And3|Python интеграции
+ekb|between1And3|боты Python
+ekb|between1And3|разработчик чат-ботов Python
+ekb|between1And3|AI Python Engineer
+ekb|between1And3|AI Backend Python
+ekb|between1And3|AI automation Python
+ekb|between1And3|AI Skills Engineer Python
+ekb|between1And3|разработчик AI агентов Python
+ekb|between1And3|продуктовый инженер AI Python
+ekb|between1And3|Vibe coding Python
+ekb|between1And3|Специалист автоматизации Python
+remote|noExperience|Python стажер
+remote|between1And3|Python разработчик
+remote|between1And3|Python Django
+remote|noExperience|Junior Python
+remote|between1And3|Junior Python Developer
+remote|noExperience|Backend Python стажер
+remote|between1And3|Backend Python
+remote|between1And3|Python API
+remote|between1And3|Python интеграции
+remote|between1And3|боты Python
+remote|between1And3|разработчик чат-ботов Python
+remote|between1And3|Conversational AI Python
+remote|between1And3|AI Python Engineer
+remote|between1And3|AI Backend Python
+remote|between1And3|AI automation Python
+remote|between1And3|AI Automation Engineer Python
+remote|between1And3|AI Skills Engineer Python
+remote|between1And3|разработчик AI агентов Python
+remote|between1And3|MCP Python
+remote|between1And3|Vibe coding Python
+remote|between1And3|продуктовый инженер AI Python
+remote|between1And3|Специалист автоматизации Python
+Программист Python
+Python API SQL
+Python интеграции API
+Разработчик Python Екатеринбург

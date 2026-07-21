@@ -86,3 +86,11 @@ CLAUDE.md
 .codex/
 uv.lock
 poetry.lock
+
+# local runtime data
+logs/
+state/
+*.backup.*
+*.bak*
+*.saved.*
+*.lock
