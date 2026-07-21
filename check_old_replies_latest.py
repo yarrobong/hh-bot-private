@@ -1,7 +1,6 @@
 import json
 import re
 import subprocess
-from datetime import datetime
 from pathlib import Path
 
 BASE = Path("/opt/hh-bot")

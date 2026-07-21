@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 
 ROOT = Path("/opt/hh-bot")
 STATE = ROOT / "state"
@@ -383,7 +383,7 @@ def build_page(token):
     drafts_html = ""
     rows = answers + asks
     if rows:
-        for fname, data, mt in rows[:60]:
+        for fname, data, _mt in rows[:60]:
             nid = str(data.get("nid") or fname.replace(".json", ""))
             title = data.get("vacancy") or data.get("title") or ""
             msg = data.get("draft_message") or data.get("ask_text") or data.get("answer") or data.get("draft_error") or ""

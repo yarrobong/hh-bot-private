@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 from text_style import humanize_outgoing_text
 
-BASE = Path("/opt/hh-bot")
+BASE = Path(os.environ.get("HH_BOT_BASE", "/opt/hh-bot"))
 ASK_DIR = BASE / "state" / "ask_requests"
 ANS_DIR = BASE / "state" / "human_answers"
 
@@ -236,9 +237,6 @@ def make_message(answer, ask_text, vacancy):
     vacancy = clean(vacancy)
 
     a = low(answer)
-    q = low(ask_text)
-    v = low(vacancy)
-
     if not answer:
         return None, "Пустой ответ. Нужно написать ответ в панели."
 

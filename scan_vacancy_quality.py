@@ -5,7 +5,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
-from collections import Counter, defaultdict
+from collections import Counter
 from html import unescape
 from pathlib import Path
 
@@ -160,7 +160,7 @@ def fetch_details(found):
     rows = []
     ids = list(found.keys())[:MAX_DETAILS]
 
-    for i, vid in enumerate(ids, 1):
+    for _i, vid in enumerate(ids, 1):
         item = found[vid]["search_items"][0]
         detail = {}
         desc = ""
@@ -307,7 +307,7 @@ for k, v in cnt.most_common():
 
 match_counter = Counter()
 for r in rows:
-    for word, frag in r["matches"]:
+    for word, _frag in r["matches"]:
         match_counter[word.lower()] += 1
 
 print()

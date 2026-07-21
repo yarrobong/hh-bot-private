@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import urllib.request
 from html import unescape
@@ -76,7 +75,7 @@ try:
         data = json.loads(r.read().decode("utf-8"))
 except Exception as e:
     print("API ERROR:", repr(e))
-    raise SystemExit(1)
+    raise SystemExit(1) from e
 
 name = data.get("name")
 employer = (data.get("employer") or {}).get("name")

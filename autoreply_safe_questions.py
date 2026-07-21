@@ -1,18 +1,28 @@
 import json
+import os
 import re
 import sys
 import subprocess
 from pathlib import Path
 from datetime import datetime
 
-BASE = Path("/opt/hh-bot")
+BASE = Path(os.environ.get("HH_BOT_BASE", "/opt/hh-bot"))
 STATE = BASE / "state"
 SEEN_FILE = STATE / "autoreply_safe_seen.json"
 REVIEW_FILE = STATE / "backfill_review.json"
+ASK_DIR = STATE / "ask_requests"
+ANS_DIR = STATE / "human_answers"
 
 STATE.mkdir(parents=True, exist_ok=True)
+ASK_DIR.mkdir(parents=True, exist_ok=True)
+ANS_DIR.mkdir(parents=True, exist_ok=True)
 
-TOOL = "/opt/hh-bot/venv/bin/hh-applicant-tool"
+TOOL = os.environ.get(
+    "HH_APPLICANT_TOOL_BIN",
+    str(BASE / "venv" / "bin" / "hh-applicant-tool"),
+)
+
+TERMINAL = {"sent", "disabled_by_employer", "test_ignored", "ignored"}
 
 BAD_VACANCY = re.compile(
     r"преподав|педагог|учитель|репетитор|школ|дет|шахмат|"
@@ -79,6 +89,14 @@ def add_review(item):
     data.append(item)
     save_json(REVIEW_FILE, data)
 
+def has_pending_human_flow(nid):
+    for path in (ASK_DIR / f"{nid}.json", ANS_DIR / f"{nid}.json"):
+        data = load_json(path, {})
+        status = data.get("status")
+        if data and status not in TERMINAL:
+            return True
+    return False
+
 def answer_for(text, vacancy):
     t = (text or "").lower()
 
@@ -142,7 +160,9 @@ def get_last_messages():
         for it in items:
             nid = str(it.get("id") or "")
             state = (it.get("state") or {}).get("id") or ""
-            if state in {"discard", "hidden"}:
+            if state not in {"response", "interview"}:
+                continue
+            if has_pending_human_flow(nid):
                 continue
 
             v = it.get("vacancy") or {}
@@ -176,7 +196,7 @@ def main():
     skipped = 0
     boot = 0
 
-    for nid, vacancy, employer, state, last in get_last_messages():
+    for nid, vacancy, employer, _state, last in get_last_messages():
         text = last.get("text") or ""
         k = msg_key(nid, last)
 

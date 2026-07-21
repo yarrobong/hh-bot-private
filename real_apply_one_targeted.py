@@ -1,7 +1,6 @@
 from pathlib import Path
 import subprocess
 import re
-import ast
 
 ROOT = Path("/opt/hh-bot")
 LOG = Path("/home/hhbot/.config/hh-applicant-tool/log.txt")
@@ -35,7 +34,7 @@ LOG.write_text("", encoding="utf-8")
 
 sent = False
 
-for i, (mode, exp, search) in enumerate(searches, 1):
+for i, (_mode, exp, search) in enumerate(searches, 1):
     print()
     print("=" * 90)
     print(f"TRY {i}: {search}")

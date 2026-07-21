@@ -282,9 +282,14 @@ class HHApplicantTool(MegaTool):
         return rv
 
     def get_negotiations(
-        self, status: str = "active"
+        self,
+        status: str = "active",
+        max_pages: int | None = None,
     ) -> Iterable[api.datatypes.Negotiation]:
         for page in count():
+            if max_pages is not None and page >= max_pages:
+                break
+
             r: dict[str, Any] = self.api_client.get(
                 "/negotiations",
                 page=page,

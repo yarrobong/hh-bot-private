@@ -1,5 +1,4 @@
 from pathlib import Path
-from datetime import datetime
 
 p = Path("/opt/hh-bot/ask_server.py")
 text = p.read_text(encoding="utf-8")

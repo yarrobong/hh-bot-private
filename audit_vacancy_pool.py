@@ -210,7 +210,7 @@ print("=" * 120)
 
 print("TOP RELEVANT EXAMPLES")
 print("-" * 120)
-for i, (vid, row) in enumerate(list(unique_relevant.items())[:80], 1):
+for i, (_vid, row) in enumerate(list(unique_relevant.items())[:80], 1):
     name, employer, area, schedule, salary_txt, url = row
     print(f"{i:02}. {name} | {employer} | {area} | {schedule} | {salary_txt} | {url}")
 

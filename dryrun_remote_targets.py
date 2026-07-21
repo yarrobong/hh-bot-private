@@ -26,7 +26,7 @@ LOG.write_text("", encoding="utf-8")
 print("remote targets:", len(targets))
 print("excluded filter loaded:", bool(excluded))
 
-for i, (mode, exp, search) in enumerate(targets, 1):
+for i, (_mode, exp, search) in enumerate(targets, 1):
     print()
     print("=" * 90)
     print(f"{i}. exp={exp} search={search}")

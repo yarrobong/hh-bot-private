@@ -1,10 +1,11 @@
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 from datetime import datetime, date
 
-BASE = Path("/opt/hh-bot")
+BASE = Path(os.environ.get("HH_BOT_BASE", "/opt/hh-bot"))
 STATE_DIR = BASE / "state"
 LOG_DIR = BASE / "logs"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -12,9 +13,15 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 SEEN_FILE = STATE_DIR / "backfill_seen.json"
 REVIEW_FILE = STATE_DIR / "backfill_review.json"
+ASK_DIR = STATE_DIR / "ask_requests"
 LOG_FILE = LOG_DIR / "backfill-watch.log"
+TOOL = os.environ.get(
+    "HH_APPLICANT_TOOL_BIN",
+    str(BASE / "venv" / "bin" / "hh-applicant-tool"),
+)
 
 NTFY_TOPIC = "hh-yaroslav-7x29q-answer"
+ASK_DIR.mkdir(parents=True, exist_ok=True)
 
 seen = {}
 if SEEN_FILE.exists():
@@ -34,7 +41,7 @@ def norm(s):
 
 def call_api(args):
     res = subprocess.run(
-        ["/opt/hh-bot/venv/bin/hh-applicant-tool", "call-api", *args],
+        [TOOL, "call-api", *args],
         text=True,
         capture_output=True,
     )
@@ -64,6 +71,8 @@ def is_past_offline_interview(text):
     return d < datetime.now().date()
 
 def ntfy(text):
+    if os.environ.get("HH_DISABLE_NTFY") == "1":
+        return
     try:
         subprocess.run(
             [
@@ -80,6 +89,48 @@ def ntfy(text):
         )
     except Exception:
         pass
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+def save_json(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def append_review(item):
+    data = load_json(REVIEW_FILE, [])
+    key = (str(item.get("negotiation_id")), item.get("text") or "")
+    for old in data:
+        if (str(old.get("negotiation_id")), old.get("text") or "") == key:
+            return
+    data.append(item)
+    save_json(REVIEW_FILE, data)
+
+def save_ask_request(item):
+    nid = str(item["negotiation_id"])
+    reason = item["reason"]
+    if reason == "possible_ai_answer":
+        ask_text = (
+            "Похоже, работодатель задал вопрос, на который можно ответить. "
+            "Проверь контекст и напиши безопасный ответ."
+        )
+    else:
+        ask_text = item["text"]
+    save_json(
+        ASK_DIR / f"{nid}.json",
+        {
+            "nid": nid,
+            "vacancy": item.get("vacancy") or "",
+            "employer": item.get("employer") or "",
+            "ask_text": ask_text,
+            "history": item.get("text") or "",
+            "status": "waiting",
+            "reason": reason,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
 
 NO_REPLY_PATTERNS = [
     r"к сожалению.*не готовы пригласить",
@@ -229,6 +280,7 @@ for n in data.get("items", []):
     review.append({
         "negotiation_id": nid,
         "vacancy": vacancy,
+        "employer": norm(((n.get("employer") or {}) or {}).get("name")),
         "created_at": created,
         "reason": reason,
         "text": text,
@@ -239,7 +291,9 @@ for n in data.get("items", []):
 SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
 
 if review:
-    REVIEW_FILE.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+    for item in review:
+        append_review(item)
+        save_ask_request(item)
     msg = f"Найдено старых диалогов для проверки: {len(review)}\n\n"
     for item in review[:5]:
         msg += f"{item['vacancy']}\n{item['reason']}\n{item['text'][:250]}\n\n"

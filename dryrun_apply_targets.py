@@ -1,7 +1,6 @@
 from pathlib import Path
 import subprocess
 import re
-import shlex
 
 ROOT = Path("/opt/hh-bot")
 LOG = Path("/home/hhbot/.config/hh-applicant-tool/log.txt")

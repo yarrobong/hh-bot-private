@@ -84,7 +84,6 @@ Session.vim
 CLAUDE.md
 .serena/
 .codex/
-uv.lock
 poetry.lock
 
 # local runtime data
@@ -94,3 +93,4 @@ state/
 *.bak*
 *.saved.*
 *.lock
+!requirements.lock

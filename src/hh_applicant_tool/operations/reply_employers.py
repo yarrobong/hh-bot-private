@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import random
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..ai.base import AIError
@@ -13,7 +16,6 @@ from ..utils.date import parse_api_datetime
 from ..utils.string import rand_text
 
 if TYPE_CHECKING:
-    from ..ai.openai import ChatOpenAI
     from ..main import HHApplicantTool
 
 
@@ -28,7 +30,6 @@ except ImportError:
 
 
 logger = logging.getLogger(__package__)
-
 
 class Namespace(BaseNamespace):
     reply_message: str
@@ -136,6 +137,168 @@ class Operation(BaseOperation):
         )
         self._reply_chats(user=me, resumes=resumes, blacklist=blacklist)
 
+    @property
+    def _bot_base(self) -> Path:
+        return Path(os.environ.get("HH_BOT_BASE", "/opt/hh-bot"))
+
+    @property
+    def _ask_dir(self) -> Path:
+        return self._bot_base / "state" / "ask_requests"
+
+    @property
+    def _answers_dir(self) -> Path:
+        return self._bot_base / "state" / "human_answers"
+
+    @staticmethod
+    def _load_json(path: Path) -> dict:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_json(path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _clean_ai_marker(text: str, marker: str) -> str:
+        marker_pos = text.upper().find(marker)
+        if marker_pos < 0:
+            return ""
+        text = text[marker_pos + len(marker):].strip()
+        if text.startswith(":"):
+            text = text[1:].strip()
+        return text
+
+    @staticmethod
+    def _is_disabled_by_employer(ex: ApiError) -> bool:
+        data = getattr(ex, "data", {}) or {}
+        if ApiError.has_error_value("disabled_by_employer", data):
+            return True
+        return "disabled_by_employer" in str(ex)
+
+    def _pending_answer_path(self, nid: str) -> Path:
+        return self._answers_dir / f"{nid}.json"
+
+    def _load_pending_draft(self, nid: str) -> tuple[Path, dict, str]:
+        path = self._pending_answer_path(nid)
+        answer = self._load_json(path)
+        if answer.get("status") != "drafted":
+            return path, answer, ""
+        draft = str(answer.get("draft_message") or "").strip()
+        if not draft:
+            return path, answer, ""
+        return path, answer, draft
+
+    def _mark_answer(
+        self,
+        path: Path,
+        answer: dict,
+        status: str,
+        **extra: str,
+    ) -> None:
+        if not answer:
+            answer = {"nid": path.stem}
+        answer["status"] = status
+        answer["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        answer.update(extra)
+        self._save_json(path, answer)
+
+    def _save_ask_request(
+        self,
+        nid: str,
+        vacancy: dict,
+        employer: dict,
+        ask_text: str,
+        message_history: list[str],
+    ) -> None:
+        ask_text = ask_text.strip() or (
+            "Нужно ваше решение по этому чату. "
+            "Посмотри контекст и напиши, что ответить работодателю."
+        )
+        self._save_json(
+            self._ask_dir / f"{nid}.json",
+            {
+                "nid": nid,
+                "vacancy": vacancy.get("name") or "",
+                "employer": employer.get("name") or "",
+                "ask_text": ask_text,
+                "history": "\n".join(message_history[-20:]),
+                "status": "waiting",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+
+    def _prepare_ai_message(
+        self,
+        nid: str,
+        vacancy: dict,
+        employer: dict,
+        send_message: str,
+        message_history: list[str],
+    ) -> str:
+        send_message = str(send_message or "").strip()
+        upper = send_message.upper()
+
+        if upper == "__SKIP__" or upper.startswith("__SKIP__"):
+            logger.debug("AI skipped chat %s", nid)
+            return ""
+
+        if "__ASK__" in upper:
+            ask_text = self._clean_ai_marker(send_message, "__ASK__")
+            self._save_ask_request(
+                nid=nid,
+                vacancy=vacancy,
+                employer=employer,
+                ask_text=ask_text,
+                message_history=message_history,
+            )
+            logger.debug("AI saved ask request for chat %s", nid)
+            return ""
+
+        return send_message
+
+    def _send_message(
+        self,
+        nid: str,
+        vacancy: dict,
+        send_message: str,
+        answer_path: Path | None = None,
+        answer_data: dict | None = None,
+    ) -> bool:
+        if self.dry_run:
+            logger.debug(
+                "dry-run: отклик на %s: %s",
+                vacancy.get("alternate_url"),
+                send_message,
+            )
+            return True
+
+        try:
+            self.api_client.post(
+                f"/negotiations/{nid}/messages",
+                message=send_message,
+                delay=random.uniform(1, 3),
+            )
+        except ApiError as ex:
+            if answer_path and self._is_disabled_by_employer(ex):
+                self._mark_answer(
+                    answer_path,
+                    answer_data or {},
+                    "disabled_by_employer",
+                    send_error=str(ex),
+                )
+            raise
+
+        if answer_path:
+            self._mark_answer(answer_path, answer_data or {}, "sent")
+        print(f"📨 Отправлено для {vacancy['alternate_url']}")
+        return True
+
     def _reply_chats(
         self,
         user: datatypes.User,
@@ -151,7 +314,7 @@ class Operation(BaseOperation):
             "phone": user.get("phone") or "",
         }
 
-        for negotiation in self.tool.get_negotiations():
+        for negotiation in self.tool.get_negotiations(max_pages=self.max_pages):
             try:
                 # try:
                 #     self.tool.storage.negotiations.save(negotiation)
@@ -246,8 +409,14 @@ class Operation(BaseOperation):
                 if is_employer_message or not negotiation.get(
                     "viewed_by_opponent"
                 ):
+                    answer_path, answer_data, draft_message = (
+                        self._load_pending_draft(nid)
+                    )
                     send_message = ""
-                    if self.reply_message:
+                    if draft_message:
+                        send_message = draft_message
+                        logger.debug("Prepared human draft: %s", send_message)
+                    elif self.reply_message:
                         send_message = (
                             rand_text(self.reply_message) % placeholders
                         )
@@ -263,6 +432,15 @@ class Operation(BaseOperation):
                             send_message = self.cover_letter_ai.complete(
                                 ai_query
                             )
+                            send_message = self._prepare_ai_message(
+                                nid=nid,
+                                vacancy=vacancy,
+                                employer=employer,
+                                send_message=send_message,
+                                message_history=message_history,
+                            )
+                            if not send_message:
+                                continue
                             logger.debug(f"AI message: {send_message}")
                         except AIError as ex:
                             logger.warning(
@@ -324,20 +502,13 @@ class Operation(BaseOperation):
                             continue
 
                     # Финальная отправка текста
-                    if self.dry_run:
-                        logger.debug(
-                            "dry-run: отклик на %s: %s",
-                            vacancy["alternate_url"],
-                            send_message,
-                        )
-                        continue
-
-                    self.api_client.post(
-                        f"/negotiations/{nid}/messages",
-                        message=send_message,
-                        delay=random.uniform(1, 3),
+                    self._send_message(
+                        nid=nid,
+                        vacancy=vacancy,
+                        send_message=send_message,
+                        answer_path=answer_path if draft_message else None,
+                        answer_data=answer_data if draft_message else None,
                     )
-                    print(f"📨 Отправлено для {vacancy['alternate_url']}")
 
             except ApiError as ex:
                 logger.error(ex)
