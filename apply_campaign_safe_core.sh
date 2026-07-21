@@ -60,6 +60,7 @@ MESSAGE_PROMPT="$(cat /opt/hh-bot/cover_letter_message_prompt.txt)"
 
 echo "===== $(date "+%F %T") apply start | count=$COUNT/$MAX_DAILY | mode=$MODE | exp=$EXP | search=$SEARCH | batch=$BATCH_SIZE =====" >> "$LOG"
 
+TMP_OUTPUT="$(mktemp)"
 set +e
 hh-applicant-tool apply-vacancies \
   --search "$SEARCH" \
@@ -78,14 +79,19 @@ hh-applicant-tool apply-vacancies \
   --message-prompt "$MESSAGE_PROMPT" \
   --force-message \
   --no-send-email \
-  --excluded-filter "$EXCLUDED_FILTER" >> "$LOG" 2>&1
+  --excluded-filter "$EXCLUDED_FILTER" 2>&1 | tee "$TMP_OUTPUT" >> "$LOG"
 RC=$?
 set -e
 
-NEW_COUNT=$((COUNT + BATCH_SIZE))
+SENT="$(grep -c "Отправили отклик на вакансию" "$TMP_OUTPUT" 2>/dev/null || true)"
+case "$SENT" in
+  ""|*[!0-9]*) SENT=0 ;;
+esac
+NEW_COUNT=$((COUNT + SENT))
 echo "$NEW_COUNT" > "$COUNT_FILE"
 
-echo "===== $(date "+%F %T") apply end | rc=$RC | reserved_count=$NEW_COUNT/$MAX_DAILY =====" >> "$LOG"
+echo "===== $(date "+%F %T") apply end | rc=$RC | actual_sent=$SENT | count=$NEW_COUNT/$MAX_DAILY =====" >> "$LOG"
+rm -f "$TMP_OUTPUT"
 
 exit 0
 '

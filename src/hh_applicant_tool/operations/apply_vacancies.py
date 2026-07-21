@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from .. import apply_safety
 from ..ai.base import AIError
 from ..api import BadResponse, Redirect, datatypes
 from ..api.datatypes import PaginatedItems, SearchVacancy
@@ -37,6 +38,16 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__package__)
+
+
+class VacancyParsingError(ValueError):
+    def __init__(self, vacancy_id: str | int | None, stage: str, reason: str):
+        self.vacancy_id = vacancy_id
+        self.stage = stage
+        self.reason = reason
+        super().__init__(
+            f"vacancy_id={vacancy_id or '<missing>'} stage={stage} reason={reason}"
+        )
 
 
 class Namespace(BaseNamespace):
@@ -320,7 +331,7 @@ class Operation(BaseOperation):
         self.currency = args.currency
         self.date_from = args.date_from
         self.date_to = args.date_to
-        self.dry_run = args.dry_run
+        self.dry_run = bool(args.dry_run or apply_safety.dry_run_enabled())
         self.employer_id = args.employer_id
         self.employment = args.employment
         self.excluded_employer_id = args.excluded_employer_id
@@ -518,7 +529,7 @@ class Operation(BaseOperation):
             except AIError as e:
                 # ChatOpenAI уже делает retry для 429, поэтому здесь только логируем
                 logger.error("Ошибка AI %s: %s", log_suffix, e)
-                return True
+                return False
 
         logger.warning(
             "AI %s не дал валидный JSON после %d попыток для вакансии %s",
@@ -526,7 +537,7 @@ class Operation(BaseOperation):
             MAX_RETRIES,
             vacancy_name,
         )
-        return True
+        return False
 
     def _parse_ai_json_response(self, response: str) -> bool | None:
         response = response.strip().lower()
@@ -795,7 +806,9 @@ class Operation(BaseOperation):
                 logger.info("Операция отменена пользователем")
                 break
             try:
-                employer = vacancy.get("employer", {})
+                employer = vacancy.get("employer") or {}
+                if not isinstance(employer, dict):
+                    employer = {}
 
                 message_placeholders = {
                     "vacancy_name": vacancy.get("name", ""),
@@ -823,7 +836,13 @@ class Operation(BaseOperation):
                 if not do_apply:
                     continue
 
-                vacancy_id = vacancy["id"]
+                vacancy_id = vacancy.get("id")
+                if not vacancy_id:
+                    logger.warning(
+                        "malformed_vacancy stage=normalize vacancy_id=<missing> reason=missing_id"
+                    )
+                    print("⚠️ Пропускаю битую вакансию: missing_id")
+                    continue
                 relations = vacancy.get("relations", [])
 
                 if relations:
@@ -871,13 +890,19 @@ class Operation(BaseOperation):
                         vacancy, "excluded_filter", resume["id"]
                     )
 
-                    self.api_client.put(
-                        f"/vacancies/blacklisted/{vacancy['id']}"
+                    guard = apply_safety.guard_apply_write(
+                        vacancy_id,
+                        resume["id"],
+                        stage="blacklist",
                     )
-                    logger.info(
-                        "Вакансия добавлена в черный список: %s",
-                        vacancy["alternate_url"],
-                    )
+                    if guard.allowed:
+                        self.api_client.put(
+                            f"/vacancies/blacklisted/{vacancy['id']}"
+                        )
+                        logger.info(
+                            "Вакансия добавлена в черный список: %s",
+                            vacancy["alternate_url"],
+                        )
                     continue
 
                 # AI фильтрация вакансий
@@ -1034,6 +1059,26 @@ class Operation(BaseOperation):
                                     logger.error(
                                         f"Произошла ошибка при отклике на вакансию с тестом: {vacancy['alternate_url']} - {err}"
                                     )
+                        else:
+                            guard = apply_safety.validate_cover_letter(letter)
+                            if guard.allowed:
+                                logger.info(
+                                    "WOULD_APPLY stage=apply_with_test vacancy_id=%s resume_id=%s",
+                                    vacancy_id,
+                                    resume["id"],
+                                )
+                                print(
+                                    "WOULD_APPLY:",
+                                    vacancy.get("alternate_url") or vacancy_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "%s stage=apply_with_test vacancy_id=%s resume_id=%s reason=%s",
+                                    guard.log_code,
+                                    vacancy_id,
+                                    resume["id"],
+                                    guard.reason,
+                                )
                     except Exception as ex:
                         logger.error(f"Произошла непредвиденная ошибка: {ex}")
                         continue
@@ -1046,17 +1091,38 @@ class Operation(BaseOperation):
                     }
                     try:
                         if not self.dry_run:
-                            res = self.api_client.post(
-                                "/negotiations",
+                            result = self._post_negotiation_safely(
                                 params,
-                                delay=random.uniform(1, 3),
+                                vacancy=vacancy,
+                                resume_id=resume["id"],
+                                stage="apply",
                             )
-                            assert res == {}
-                            applied_count += 1
-                            print(
-                                "📨 Отправили отклик на вакансию",
-                                vacancy["alternate_url"],
-                            )
+                            if result == "sent":
+                                applied_count += 1
+                                print(
+                                    "📨 Отправили отклик на вакансию",
+                                    vacancy["alternate_url"],
+                                )
+                        else:
+                            guard = apply_safety.validate_cover_letter(letter)
+                            if guard.allowed:
+                                logger.info(
+                                    "WOULD_APPLY stage=apply vacancy_id=%s resume_id=%s",
+                                    vacancy_id,
+                                    resume["id"],
+                                )
+                                print(
+                                    "WOULD_APPLY:",
+                                    vacancy.get("alternate_url") or vacancy_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "%s stage=apply vacancy_id=%s resume_id=%s reason=%s",
+                                    guard.log_code,
+                                    vacancy_id,
+                                    resume["id"],
+                                    guard.reason,
+                                )
                     except Redirect:
                         logger.warning(
                             f"Игнорирую перенаправление на форму: {vacancy['alternate_url']}"  # noqa: E501
@@ -1070,17 +1136,18 @@ class Operation(BaseOperation):
                             )
                             if success:
                                 if not self.dry_run:
-                                    res = self.api_client.post(
-                                        "/negotiations",
+                                    result = self._post_negotiation_safely(
                                         params,
-                                        delay=random.uniform(1, 3),
+                                        vacancy=vacancy,
+                                        resume_id=resume["id"],
+                                        stage="apply_after_captcha",
                                     )
-                                    assert res == {}
-                                    applied_count += 1
-                                    print(
-                                        "📨 Отправили отклик на вакансию после капчи",
-                                        vacancy["alternate_url"],
-                                    )
+                                    if result == "sent":
+                                        applied_count += 1
+                                        print(
+                                            "📨 Отправили отклик на вакансию после капчи",
+                                            vacancy["alternate_url"],
+                                        )
                             else:
                                 logger.error("Не удалось решить капчу")
                                 raise
@@ -1127,6 +1194,15 @@ class Operation(BaseOperation):
                     applied_count,
                 )
                 break
+            except VacancyParsingError as ex:
+                logger.warning("malformed_vacancy %s", ex)
+                try:
+                    self._save_skipped_vacancy(
+                        vacancy, f"malformed:{ex.stage}:{ex.reason}", resume["id"]
+                    )
+                except Exception:
+                    pass
+                continue
             except ApiError as ex:
                 logger.warning(ex)
             except (BadResponse, AIError) as ex:
@@ -1142,6 +1218,102 @@ class Operation(BaseOperation):
             f"✅️ Закончили рассылку для резюме: {resume['title']}. Отправлено: {applied_count}"
         )
         return limit_reached
+
+    def _post_negotiation_safely(
+        self,
+        params: dict[str, Any],
+        *,
+        vacancy: SearchVacancy,
+        resume_id: str,
+        stage: str,
+    ) -> str:
+        vacancy_id = params.get("vacancy_id") or vacancy.get("id")
+        letter = params.get("message") or ""
+        guard = apply_safety.guard_apply_post(
+            vacancy_id,
+            resume_id,
+            letter,
+            stage=stage,
+        )
+        if not guard.allowed:
+            if guard.log_code == "WOULD_APPLY":
+                print("WOULD_APPLY:", vacancy.get("alternate_url") or vacancy_id)
+            return "blocked"
+
+        with apply_safety.atomic_apply_claim(
+            vacancy_id,
+            resume_id,
+            owner="apply_vacancies",
+            stage=stage,
+        ) as claim:
+            if not claim.acquired:
+                logger.info(
+                    "duplicate_apply_claim vacancy_id=%s resume_id=%s status=%s",
+                    vacancy_id,
+                    resume_id,
+                    claim.status,
+                )
+                return "duplicate"
+            try:
+                res = self.api_client.post(
+                    "/negotiations",
+                    params,
+                    delay=random.uniform(1, 3),
+                )
+                assert res == {}
+            except LimitExceeded:
+                apply_safety.release_retryable_claim(
+                    vacancy_id, resume_id, reason="limit_exceeded"
+                )
+                raise
+            except CaptchaRequired:
+                apply_safety.release_retryable_claim(
+                    vacancy_id, resume_id, reason="captcha_required"
+                )
+                raise
+            except Redirect:
+                apply_safety.update_claim(
+                    vacancy_id, resume_id, "needs_review", reason="redirect_form"
+                )
+                return "needs_review"
+            except ApiError as ex:
+                if ex.status_code == 401:
+                    apply_safety.release_retryable_claim(
+                        vacancy_id, resume_id, reason="unauthorized"
+                    )
+                    raise
+                if ex.status_code == 409 or ApiError.has_error_value(
+                    "already_applied", ex.data
+                ):
+                    apply_safety.update_claim(
+                        vacancy_id,
+                        resume_id,
+                        "already_applied",
+                        reason="already_applied",
+                    )
+                    return "already_applied"
+                if ex.status_code == 429 or ex.status_code >= 500:
+                    apply_safety.release_retryable_claim(
+                        vacancy_id,
+                        resume_id,
+                        reason=f"retryable_http_{ex.status_code}",
+                    )
+                    return "retryable_error"
+                apply_safety.update_claim(
+                    vacancy_id,
+                    resume_id,
+                    "terminal_error",
+                    reason=f"http_{ex.status_code}",
+                )
+                return "terminal_error"
+            except requests.RequestException as ex:
+                apply_safety.release_retryable_claim(
+                    vacancy_id, resume_id, reason=type(ex).__name__
+                )
+                return "retryable_error"
+
+        apply_safety.update_claim(vacancy_id, resume_id, "sent")
+        return "sent"
 
     def _send_email(self, to: str, subject: str, body: str) -> None:
         cfg = self.tool.config.get("smtp", {})
@@ -1266,22 +1438,46 @@ class Operation(BaseOperation):
 
         logger.debug(f"{payload = }")
 
+        guard = apply_safety.guard_apply_post(
+            vacancy_id,
+            resume_hash,
+            letter,
+            stage="apply_with_test_popup",
+        )
+        if not guard.allowed:
+            return {"success": "false", "error": guard.reason}
+
+        with apply_safety.atomic_apply_claim(
+            vacancy_id,
+            resume_hash,
+            owner="apply_vacancies",
+            stage="apply_with_test_popup",
+        ) as claim:
+            if not claim.acquired:
+                return {"success": "false", "error": "duplicate_claim"}
+
         # Ожидание перед отправкой (float)
         time.sleep(random.uniform(2.0, 3.0))
 
-        response = self.tool.session.post(
-            "https://hh.ru/applicant/vacancy_response/popup",
-            data=payload,
-            headers={
-                "Referer": response_url,
-                # x-gib-fgsscgib-w-hh и x-gib-gsscgib-w-hh вроде в куках
-                # передаются и не нужны
-                "X-Hhtmfrom": "vacancy",
-                "X-Hhtmsource": "vacancy_response",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-Xsrftoken": self.tool.xsrf_token,
-            },
-        )
+        try:
+            response = self.tool.session.post(
+                "https://hh.ru/applicant/vacancy_response/popup",
+                data=payload,
+                headers={
+                    "Referer": response_url,
+                    # x-gib-fgsscgib-w-hh и x-gib-gsscgib-w-hh вроде в куках
+                    # передаются и не нужны
+                    "X-Hhtmfrom": "vacancy",
+                    "X-Hhtmsource": "vacancy_response",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-Xsrftoken": self.tool.xsrf_token,
+                },
+            )
+        except requests.RequestException as ex:
+            apply_safety.release_retryable_claim(
+                vacancy_id, resume_hash, reason=type(ex).__name__
+            )
+            raise
 
         logger.debug(
             "%s %s %d",
@@ -1290,8 +1486,39 @@ class Operation(BaseOperation):
             response.status_code,
         )
 
-        data = response.json()
+        if response.status_code == 429 or response.status_code >= 500:
+            apply_safety.release_retryable_claim(
+                vacancy_id,
+                resume_hash,
+                reason=f"popup_retryable_http_{response.status_code}",
+            )
+            return {"success": "false", "error": "retryable_http_error"}
+        if response.status_code == 401:
+            apply_safety.release_retryable_claim(
+                vacancy_id,
+                resume_hash,
+                reason="popup_unauthorized",
+            )
+            return {"success": "false", "error": "unauthorized"}
+
+        try:
+            data = response.json()
+        except ValueError:
+            apply_safety.release_retryable_claim(
+                vacancy_id, resume_hash, reason="popup_malformed_json"
+            )
+            return {"success": "false", "error": "malformed_json"}
         # logger.debug(data)
+
+        if data.get("success") == "true":
+            apply_safety.update_claim(vacancy_id, resume_hash, "sent")
+        else:
+            apply_safety.update_claim(
+                vacancy_id,
+                resume_hash,
+                "terminal_error",
+                reason=str(data.get("error") or "popup_error"),
+            )
 
         return data
 
@@ -1451,7 +1678,9 @@ class Operation(BaseOperation):
         if not self.excluded_filter:
             return False
 
-        snippet = vacancy.get("snippet", {})
+        snippet = vacancy.get("snippet") or {}
+        if not isinstance(snippet, dict):
+            snippet = {}
         vacancy_summary = " ".join(
             filter(
                 None,
@@ -1473,11 +1702,26 @@ class Operation(BaseOperation):
             return True
 
         # Грузим полный текст вакансии только, если предыдущий фильтр не сработал
-        r = self.tool.session.get("https://hh.ru/vacancy/" + vacancy["id"])
-        r.raise_for_status()
+        vacancy_id = vacancy.get("id")
+        if not vacancy_id:
+            raise VacancyParsingError(None, "excluded_filter", "missing_id")
+
+        try:
+            r = self.tool.session.get("https://hh.ru/vacancy/" + str(vacancy_id))
+            r.raise_for_status()
+        except requests.RequestException as ex:
+            raise VacancyParsingError(
+                vacancy_id, "excluded_filter_fetch", type(ex).__name__
+            ) from ex
+
+        match = re.search(r'"description": (.*)', r.text)
+        if not match:
+            raise VacancyParsingError(
+                vacancy_id, "excluded_filter_parse", "description_not_found"
+            )
 
         description, _ = self.json_decoder.raw_decode(
-            re.search(r'"description": (.*)', r.text).group(1)
+            match.group(1)
         )
         description = strip_tags(description)
         logger.debug(description[:2047])

@@ -23,6 +23,12 @@ COUNT_FILE="$STATE_DIR/responses-$TODAY.count"
 LOG_FILE="$LOG_DIR/apply-$TODAY.log"
 LOCK_FILE="$STATE_DIR/apply.lock"
 
+if [ "${HH_APPLY_DRY_RUN:-0}" = "1" ]; then
+  echo "[$(date '+%F %T')] HH_APPLY_DRY_RUN=1: real HH applications disabled" >> "$LOG_FILE"
+elif [ "${HH_APPLY_SEND_ENABLED:-0}" != "1" ]; then
+  echo "[$(date '+%F %T')] HH_APPLY_SEND_ENABLED is not 1: real HH applications blocked" >> "$LOG_FILE"
+fi
+
 exec 9>"$LOCK_FILE"
 flock -n 9 || {
   echo "[$(date '+%F %T')] Already running, exit" >> "$LOG_FILE"

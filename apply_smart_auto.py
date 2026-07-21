@@ -172,6 +172,10 @@ left_today = max(0, MAX_DAILY - before)
 target = min(BATCH_SIZE, left_today)
 
 print(f"===== smart apply start | count={before}/{MAX_DAILY} | target={target} =====")
+if os.environ.get("HH_APPLY_DRY_RUN") == "1":
+    print("HH_APPLY_DRY_RUN=1: real HH applications disabled")
+elif os.environ.get("HH_APPLY_SEND_ENABLED") != "1":
+    print("HH_APPLY_SEND_ENABLED is not 1: real HH applications blocked")
 
 if target <= 0:
     print("DAILY LIMIT REACHED")
