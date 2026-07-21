@@ -11,9 +11,11 @@ from hh_applicant_tool.apply_pipeline import (
     FakeApplyTransport,
     fixture_matrix,
     fixture_vacancy,
+    real_dry_run_regression_vacancies,
     normalize_vacancy,
     parse_ai_decision,
     run_apply_pipeline,
+    VacancyEvaluator,
 )
 from hh_applicant_tool.operations.apply_vacancies import Operation, VacancyParsingError
 
@@ -226,6 +228,203 @@ def test_hard_exclusions_have_priority_over_ai(monkeypatch):
 
     assert transport.posts == []
     assert result.metrics.locally_rejected == 1
+
+
+@pytest.mark.parametrize(
+    ("vacancy", "reason"),
+    [
+        (
+            fixture_vacancy(
+                "8001",
+                "Python Django junior",
+                "skip",
+                area="Краснодар",
+                schedule="fullDay",
+                work_format="Гибрид",
+            ),
+            "office_or_hybrid_not_ekb",
+        ),
+        (
+            fixture_vacancy(
+                "8002",
+                "Junior LLM Engineer",
+                "skip",
+                area="Казань",
+                schedule="fullDay",
+                work_format="Гибрид",
+            ),
+            "office_or_hybrid_not_ekb",
+        ),
+        (
+            fixture_vacancy(
+                "8003",
+                "Младший Fullstack разработчик",
+                "skip",
+                area="Симферополь",
+                schedule="fullDay",
+                work_format="На месте работодателя",
+            ),
+            "office_not_ekb",
+        ),
+        (
+            fixture_vacancy(
+                "8004",
+                "Data Scientist junior",
+                "skip",
+                area="Нижний Новгород",
+                schedule="fullDay",
+                work_format="Офис",
+                text="Machine Learning RecSys Python",
+            ),
+            "office_not_ekb+role_mismatch",
+        ),
+        (
+            fixture_vacancy(
+                "8005",
+                "Преподаватель по информатике",
+                "skip",
+                area="Казань",
+                schedule="fullDay",
+                work_format="На месте работодателя",
+                text="учитель педагог работа с детьми",
+            ),
+            "office_not_ekb+teaching_children",
+        ),
+    ],
+)
+def test_geography_and_hard_exclusion_cases(vacancy, reason):
+    normalized, parse_reason = normalize_vacancy(vacancy)
+    assert parse_reason == "ok"
+    assert normalized is not None
+
+    assert VacancyEvaluator().evaluate(normalized) == ("skip", reason)
+
+
+@pytest.mark.parametrize("vacancy", real_dry_run_regression_vacancies())
+def test_real_server_dry_run_regression_fixtures_zero_would_apply(monkeypatch, vacancy):
+    monkeypatch.setenv("HH_APPLY_DRY_RUN", "1")
+    transport = FakeApplyTransport()
+
+    result = run_apply_pipeline(
+        [vacancy],
+        ai=FakeAIEvaluator({vacancy["id"]: '{"decision":"apply"}'}),
+        transport=transport,
+    )
+
+    assert result.metrics.would_apply == 0
+    assert result.metrics.actual_sent == 0
+    assert transport.posts == []
+    assert result.decisions[0].decision == "skip"
+
+
+def test_remote_moscow_is_allowed_when_remote_confirmed(monkeypatch):
+    monkeypatch.setenv("HH_APPLY_DRY_RUN", "1")
+    vacancy = fixture_vacancy(
+        "8010",
+        "Python backend",
+        "apply",
+        area="Москва",
+        schedule="remote",
+    )
+
+    result = run_apply_pipeline([vacancy])
+
+    assert result.metrics.would_apply == 1
+
+
+@pytest.mark.parametrize("work_format", ["Офис", "Гибрид"])
+def test_ekb_office_or_hybrid_is_allowed(monkeypatch, work_format):
+    monkeypatch.setenv("HH_APPLY_DRY_RUN", "1")
+    vacancy = fixture_vacancy(
+        "8020",
+        "Python backend",
+        "apply",
+        area="Екатеринбург",
+        schedule="fullDay",
+        work_format=work_format,
+    )
+
+    result = run_apply_pipeline([vacancy])
+
+    assert result.metrics.would_apply == 1
+
+
+def test_unknown_area_and_unknown_work_format_needs_review():
+    vacancy = fixture_vacancy(
+        "8030",
+        "Python backend",
+        "needs_review",
+        area="",
+        schedule="",
+        work_format="",
+    )
+    normalized, _ = normalize_vacancy(vacancy)
+
+    assert normalized is not None
+    assert VacancyEvaluator().evaluate(normalized) == (
+        "needs_review",
+        "unknown_location_or_format",
+    )
+
+
+class FakeApplyApiClient:
+    def __init__(self, full_vacancy):
+        self.full_vacancy = full_vacancy
+        self.posts = []
+
+    def get(self, endpoint, params=None):
+        if endpoint.startswith("/vacancies/"):
+            return self.full_vacancy
+        raise AssertionError(endpoint)
+
+    def post(self, *args, **kwargs):
+        self.posts.append((args, kwargs))
+        raise AssertionError("POST must not be called")
+
+    def put(self, *args, **kwargs):
+        raise AssertionError("PUT must not be called")
+
+
+def test_search_snippet_suitable_but_full_vacancy_city_skips_after_enrichment():
+    search = fixture_vacancy(
+        "8040",
+        "Python Django junior",
+        "apply",
+        area="Россия",
+        schedule="remote",
+    )
+    search.pop("work_format")
+    search.pop("description", None)
+    full = {
+        **search,
+        "area": {"name": "Краснодар"},
+        "schedule": {"id": "fullDay"},
+        "work_format": [{"name": "Гибрид"}],
+        "description": "Периодически необходимо работать на территории работодателя.",
+    }
+    op = Operation()
+    op.tool = type("Tool", (), {"api_client": FakeApplyApiClient(full)})()
+
+    enriched, decision, reason = op._prepare_and_evaluate_vacancy(search)
+    normalized, _ = normalize_vacancy(enriched)
+
+    assert decision == "skip"
+    assert reason == "office_or_hybrid_not_ekb"
+    assert normalized is not None
+    assert normalized.area == "Краснодар"
+
+
+def test_production_prepare_and_fixture_pipeline_same_decision(monkeypatch):
+    monkeypatch.setenv("HH_APPLY_DRY_RUN", "1")
+    vacancy = real_dry_run_regression_vacancies()[0]
+    op = Operation()
+    op.tool = type("Tool", (), {"api_client": FakeApplyApiClient(vacancy)})()
+
+    _, prod_decision, prod_reason = op._prepare_and_evaluate_vacancy(vacancy)
+    fixture_result = run_apply_pipeline([vacancy])
+
+    assert fixture_result.decisions[0].decision == prod_decision
+    assert fixture_result.decisions[0].reason == prod_reason
 
 
 @pytest.mark.parametrize("outcome", ["409"])

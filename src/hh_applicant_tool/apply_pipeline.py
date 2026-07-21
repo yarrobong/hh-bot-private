@@ -33,7 +33,20 @@ TARGET_RE = re.compile(
     re.I,
 )
 JUNIOR_RE = re.compile(r"junior|стаж[её]р|trainee|обучени|без опыта|noexperience", re.I)
+SENIORITY_EXCLUDE_RE = re.compile(r"\bmiddle\b|\bsenior\b|\blead\b|ведущ|тимлид|архитектор", re.I)
 CONTROL_MARKER_RE = apply_safety.CONTROL_MARKER_RE
+EKB_AREAS = {"екатеринбург", "ekaterinburg"}
+REMOTE_MARKERS = {"remote", "удаленная", "удалённая", "удаленно", "удалённо"}
+OFFICE_MARKERS = {
+    "fullDay",
+    "shift",
+    "flexible",
+    "flyInFlyOut",
+    "на месте работодателя",
+    "офис",
+    "гибрид",
+    "hybrid",
+}
 
 
 class AIEvaluator(Protocol):
@@ -47,8 +60,12 @@ class NormalizedVacancy:
     title: str
     employer: str
     area: str
+    address_city: str
     schedule: str
+    work_format: str
     experience: str
+    employment: str
+    professional_roles: tuple[str, ...]
     salary_from: int | None
     salary_to: int | None
     salary_unknown: bool
@@ -59,6 +76,10 @@ class NormalizedVacancy:
     has_test: bool
     response_url: str
     raw: dict[str, Any]
+
+    @property
+    def display_format(self) -> str:
+        return self.work_format or self.schedule or "unknown"
 
 
 @dataclass
@@ -183,6 +204,28 @@ def normalize_vacancy(raw: dict[str, Any]) -> tuple[NormalizedVacancy | None, st
     snippet = raw.get("snippet") if isinstance(raw.get("snippet"), dict) else {}
     schedule = raw.get("schedule") if isinstance(raw.get("schedule"), dict) else {}
     experience = raw.get("experience") if isinstance(raw.get("experience"), dict) else {}
+    address = raw.get("address") if isinstance(raw.get("address"), dict) else {}
+    employment = raw.get("employment") if isinstance(raw.get("employment"), dict) else {}
+    work_format_raw = raw.get("work_format")
+    work_formats: list[str] = []
+    if isinstance(work_format_raw, list):
+        work_formats = [
+            text_value(item.get("id") or item.get("name"))
+            for item in work_format_raw
+            if isinstance(item, dict)
+        ]
+    elif isinstance(work_format_raw, dict):
+        work_formats = [
+            text_value(work_format_raw.get("id") or work_format_raw.get("name"))
+        ]
+    professional_roles_raw = raw.get("professional_roles")
+    professional_roles: list[str] = []
+    if isinstance(professional_roles_raw, list):
+        professional_roles = [
+            text_value(item.get("name") or item.get("id"))
+            for item in professional_roles_raw
+            if isinstance(item, dict)
+        ]
     text = "\n".join(
         filter(
             None,
@@ -200,8 +243,12 @@ def normalize_vacancy(raw: dict[str, Any]) -> tuple[NormalizedVacancy | None, st
             title=text_value(raw.get("name")) or f"vacancy {vacancy_id}",
             employer=text_value(employer.get("name")),
             area=text_value(area.get("name")),
+            address_city=text_value(address.get("city")),
             schedule=text_value(schedule.get("id") or schedule.get("name")),
+            work_format=", ".join(filter(None, work_formats)),
             experience=text_value(experience.get("id") or experience.get("name")),
+            employment=text_value(employment.get("id") or employment.get("name")),
+            professional_roles=tuple(filter(None, professional_roles)),
             salary_from=salary.get("from") if salary else None,
             salary_to=salary.get("to") if salary else None,
             salary_unknown=salary is None,
@@ -218,34 +265,118 @@ def normalize_vacancy(raw: dict[str, Any]) -> tuple[NormalizedVacancy | None, st
 
 
 def local_decision(vacancy: NormalizedVacancy) -> tuple[str, str]:
-    haystack = f"{vacancy.title}\n{vacancy.employer}\n{vacancy.area}\n{vacancy.text}"
-    low = haystack.lower()
-    if vacancy.archived:
-        return "already_processed", "archived"
-    if vacancy.relations:
-        if "got_rejection" in vacancy.relations:
-            return "already_processed", "employer_rejection"
-        return "already_processed", "already_has_relation"
-    if HARD_EXCLUDE_RE.search(haystack):
-        return "skip", "hard_exclusion"
-    if re.search(r"переезд|релокац", low) and "екатеринбург" not in low:
-        return "skip", "relocation_not_ekb"
-    if vacancy.schedule != "remote" and vacancy.area not in {"Екатеринбург", "Ekaterinburg"}:
-        if re.search(r"москва|санкт-петербург|спб|saint petersburg|moscow", low):
+    return VacancyEvaluator().evaluate(vacancy)
+
+
+class VacancyEvaluator:
+    def evaluate(self, vacancy: NormalizedVacancy) -> tuple[str, str]:
+        haystack = "\n".join(
+            filter(
+                None,
+                [
+                    vacancy.title,
+                    vacancy.employer,
+                    vacancy.area,
+                    vacancy.address_city,
+                    vacancy.schedule,
+                    vacancy.work_format,
+                    vacancy.experience,
+                    vacancy.employment,
+                    " ".join(vacancy.professional_roles),
+                    vacancy.text,
+                ],
+            )
+        )
+        low = haystack.lower()
+        geography_decision = self._evaluate_geography(vacancy, low)
+        if vacancy.archived:
+            return "already_processed", "archived"
+        if vacancy.relations:
+            if "got_rejection" in vacancy.relations:
+                return "already_processed", "employer_rejection"
+            return "already_processed", "already_has_relation"
+        if geography_decision:
+            hard_reason = self._hard_exclusion_reason(haystack)
+            if geography_decision[0] == "skip" and hard_reason:
+                return "skip", f"{geography_decision[1]}+{hard_reason}"
+            return geography_decision
+        hard_reason = self._hard_exclusion_reason(haystack)
+        if hard_reason:
+            return "skip", hard_reason
+        if re.search(r"переезд|релокац", low) and "екатеринбург" not in low:
+            return "skip", "relocation_not_ekb"
+        if vacancy.salary_to is not None and vacancy.salary_to < 30000:
+            return "skip", "salary_below_minimum"
+        if vacancy.has_test or vacancy.response_url or re.search(
+            r"анкета|тестов[а-я ]+задани|google forms|внешн[а-я ]+сайт", low
+        ):
+            return "needs_review", "questions_or_external_form"
+        if not vacancy.text:
+            return "needs_review", "insufficient_data"
+        if re.search(r"\b(java|c#|php)\b", low) and (
+            SENIORITY_EXCLUDE_RE.search(low) or not JUNIOR_RE.search(low)
+        ):
+            return "skip", "non_junior_java_csharp_php"
+        if TARGET_RE.search(haystack):
+            return "apply", "profile_match"
+        if vacancy.text.strip() == vacancy.title:
+            return "needs_review", "insufficient_data"
+        return "skip", "profile_mismatch"
+
+    def _evaluate_geography(
+        self, vacancy: NormalizedVacancy, low: str
+    ) -> tuple[str, str] | None:
+        area = vacancy.area.strip().lower()
+        address_city = vacancy.address_city.strip().lower()
+        fmt = f"{vacancy.schedule} {vacancy.work_format}".strip().lower()
+        is_remote = any(marker in fmt for marker in REMOTE_MARKERS)
+        is_hybrid = "гибрид" in fmt or "hybrid" in fmt
+        is_office = bool(fmt) and not is_remote
+        is_ekb = area in EKB_AREAS or address_city in EKB_AREAS
+
+        if is_remote and not is_hybrid:
+            return None
+        if is_hybrid and not is_ekb:
+            return "skip", "office_or_hybrid_not_ekb"
+        if is_office and not is_ekb:
             return "skip", "office_not_ekb"
-    if vacancy.salary_to is not None and vacancy.salary_to < 30000:
-        return "skip", "salary_below_minimum"
-    if vacancy.has_test or vacancy.response_url or re.search(r"анкета|тестов[а-я ]+задани|google forms|внешн[а-я ]+сайт", low):
-        return "needs_review", "questions_or_external_form"
-    if not vacancy.text:
-        return "needs_review", "insufficient_data"
-    if re.search(r"\b(java|c#|php)\b", low) and not JUNIOR_RE.search(low):
-        return "skip", "non_junior_java_csharp_php"
-    if TARGET_RE.search(haystack):
-        return "apply", "profile_match"
-    if vacancy.text.strip() == vacancy.title:
-        return "needs_review", "insufficient_data"
-    return "skip", "profile_mismatch"
+        if not fmt and not area:
+            return "needs_review", "unknown_location_or_format"
+        if not fmt and area and not is_ekb and "удален" not in low and "удалён" not in low:
+            return "needs_review", "unknown_work_format"
+        return None
+
+    def _hard_exclusion_reason(self, haystack: str) -> str:
+        low = haystack.lower()
+        if re.search(r"преподавател|учитель|педагог|дет[еи]|школьник", low):
+            return "teaching_children"
+        if re.search(r"первая линия|1.?я линия|техподдержк|техническ[а-я ]+поддержк|helpdesk|оператор|call.?center|колл.?центр", low):
+            return "support_or_call_center"
+        if re.search(r"\bqa\b|\baqa\b|тестировщик|тестировани", low):
+            return "qa"
+        if re.search(r"продаж|холодн[ыех ]+звон", low):
+            return "sales"
+        if re.search(r"маркетинг|smm", low):
+            return "marketing"
+        if re.search(r"\b1с\b|1c\b", low):
+            return "one_c"
+        if re.search(r"c\+\+|qt\b|qml", low):
+            return "cpp_qt"
+        if re.search(r"embedded|встраиваем|stm32|микроконтрол", low):
+            return "embedded"
+        if re.search(r"производств|рабоч[а-я ]+специальност", low):
+            return "production"
+        if re.search(r"data scientist|data science|machine learning|recsys|ml engineer|ml-инженер", low):
+            return "role_mismatch"
+        return ""
+
+
+def format_decision_line(prefix: str, vacancy: NormalizedVacancy, reason: str) -> str:
+    return (
+        f"{prefix} vacancy_id={vacancy.id} title={vacancy.title!r} "
+        f"area={vacancy.area or 'unknown'} format={vacancy.display_format} "
+        f"reason={reason} url={vacancy.url}"
+    )
 
 
 def parse_ai_decision(response: str) -> tuple[str, str]:
@@ -491,6 +622,9 @@ def fixture_vacancy(
     has_test: bool = False,
     response_url: str = "",
     url: str | None = None,
+    work_format: str = "",
+    address_city: str = "",
+    professional_roles: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": vid,
@@ -500,7 +634,13 @@ def fixture_vacancy(
         "employer": {"name": f"Employer {vid}"},
         "salary": salary,
         "schedule": {"id": schedule},
+        "work_format": [{"name": work_format}] if work_format else [],
+        "address": {"city": address_city} if address_city else None,
         "experience": {"id": "noExperience"},
+        "employment": {"id": "full"},
+        "professional_roles": [
+            {"name": role} for role in (professional_roles or [])
+        ],
         "snippet": {"requirement": text, "responsibility": text},
         "relations": relations or [],
         "archived": archived,
@@ -541,6 +681,7 @@ def fixture_matrix() -> list[dict[str, Any]]:
         fixture_vacancy("2012", "Python офис Москва", "skip", area="Москва", schedule="fullDay", text="офис Москва Python"),
         fixture_vacancy("2013", "Python с переездом в Санкт-Петербург", "skip", text="обязательный переезд Санкт-Петербург Python"),
         fixture_vacancy("2014", "Низкая зарплата Python", "skip", salary={"from": 15000, "to": 25000}),
+        *real_dry_run_regression_vacancies(),
         fixture_vacancy("3001", "Python с анкетой", "needs_review", response_url="https://hh.ru/form"),
         fixture_vacancy("3002", "Python с тестовым заданием", "needs_review", has_test=True),
         fixture_vacancy("3003", "Python external form", "needs_review", text="Python google forms внешний сайт"),
@@ -577,6 +718,58 @@ def fixture_matrix() -> list[dict[str, Any]]:
         },
     ]
     return data
+
+
+def real_dry_run_regression_vacancies() -> list[dict[str, Any]]:
+    return [
+        fixture_vacancy(
+            "135311616",
+            "Junior-разработчик / вайбкодер",
+            "skip",
+            area="Краснодар",
+            schedule="fullDay",
+            work_format="Гибрид",
+            text="Python Django junior. Периодически необходимо работать на территории работодателя.",
+        ),
+        fixture_vacancy(
+            "135389858",
+            "Junior LLM Engineer",
+            "skip",
+            area="Казань",
+            schedule="fullDay",
+            work_format="Гибрид",
+            text="LLM Python junior, гибридный формат работы.",
+        ),
+        fixture_vacancy(
+            "135397712",
+            "Младший Fullstack разработчик",
+            "skip",
+            area="Симферополь",
+            schedule="fullDay",
+            work_format="На месте работодателя",
+            text="Fullstack JavaScript Python, работа на месте работодателя.",
+        ),
+        fixture_vacancy(
+            "135364012",
+            "Data Scientist junior",
+            "skip",
+            area="Нижний Новгород",
+            schedule="fullDay",
+            work_format="Офис",
+            text="Machine Learning RecSys data science Python.",
+            professional_roles=["Data Scientist"],
+        ),
+        fixture_vacancy(
+            "135435089",
+            "Преподаватель по информатике",
+            "skip",
+            area="Казань",
+            schedule="fullDay",
+            work_format="На месте работодателя",
+            text="Преподаватель информатики, педагог, работа с детьми.",
+            professional_roles=["Преподаватель"],
+        ),
+    ]
 
 
 SCENARIOS = {

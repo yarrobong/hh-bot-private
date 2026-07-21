@@ -19,6 +19,11 @@ import requests
 
 from .. import apply_safety
 from ..ai.base import AIError
+from ..apply_pipeline import (
+    VacancyEvaluator,
+    format_decision_line,
+    normalize_vacancy,
+)
 from ..api import BadResponse, Redirect, datatypes
 from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
@@ -38,6 +43,20 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__package__)
+
+REQUIRED_VACANCY_FIELDS = {
+    "area",
+    "address",
+    "schedule",
+    "work_format",
+    "description",
+    "professional_roles",
+    "experience",
+    "salary",
+    "employment",
+    "has_test",
+    "response_letter_required",
+}
 
 
 class VacancyParsingError(ValueError):
@@ -843,6 +862,34 @@ class Operation(BaseOperation):
                     )
                     print("⚠️ Пропускаю битую вакансию: missing_id")
                     continue
+                vacancy, local_decision, local_reason = (
+                    self._prepare_and_evaluate_vacancy(vacancy)
+                )
+                if local_decision != "apply":
+                    normalized, _ = normalize_vacancy(vacancy)
+                    if normalized:
+                        prefix = (
+                            "WOULD_SKIP"
+                            if local_decision != "needs_review"
+                            else "WOULD_REVIEW"
+                        )
+                        print(
+                            format_decision_line(
+                                prefix, normalized, local_reason
+                            )
+                        )
+                    self._save_skipped_vacancy(
+                        vacancy, local_reason, resume["id"]
+                    )
+                    continue
+
+                normalized, _ = normalize_vacancy(vacancy)
+                if normalized and self.dry_run:
+                    logger.info(
+                        "local_evaluator_pass vacancy_id=%s reason=%s",
+                        normalized.id,
+                        local_reason,
+                    )
                 relations = vacancy.get("relations", [])
 
                 if relations:
@@ -1067,10 +1114,15 @@ class Operation(BaseOperation):
                                     vacancy_id,
                                     resume["id"],
                                 )
-                                print(
-                                    "WOULD_APPLY:",
-                                    vacancy.get("alternate_url") or vacancy_id,
-                                )
+                                normalized, _ = normalize_vacancy(vacancy)
+                                if normalized:
+                                    print(
+                                        format_decision_line(
+                                            "WOULD_APPLY",
+                                            normalized,
+                                            "profile_match",
+                                        )
+                                    )
                             else:
                                 logger.warning(
                                     "%s stage=apply_with_test vacancy_id=%s resume_id=%s reason=%s",
@@ -1111,10 +1163,15 @@ class Operation(BaseOperation):
                                     vacancy_id,
                                     resume["id"],
                                 )
-                                print(
-                                    "WOULD_APPLY:",
-                                    vacancy.get("alternate_url") or vacancy_id,
-                                )
+                                normalized, _ = normalize_vacancy(vacancy)
+                                if normalized:
+                                    print(
+                                        format_decision_line(
+                                            "WOULD_APPLY",
+                                            normalized,
+                                            "profile_match",
+                                        )
+                                    )
                             else:
                                 logger.warning(
                                     "%s stage=apply vacancy_id=%s resume_id=%s reason=%s",
@@ -1314,6 +1371,60 @@ class Operation(BaseOperation):
 
         apply_safety.update_claim(vacancy_id, resume_id, "sent")
         return "sent"
+
+    def _prepare_and_evaluate_vacancy(
+        self, vacancy: SearchVacancy
+    ) -> tuple[SearchVacancy, str, str]:
+        vacancy_id = vacancy.get("id")
+        if not vacancy_id:
+            return vacancy, "malformed", "missing_id"
+
+        enriched = vacancy
+        if self._needs_vacancy_enrichment(vacancy):
+            try:
+                full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
+                enriched = {**vacancy, **full_vacancy}
+                if not full_vacancy.get("relations") and vacancy.get("relations"):
+                    enriched["relations"] = vacancy["relations"]
+            except Exception as ex:
+                logger.warning(
+                    "vacancy_enrichment_failed vacancy_id=%s stage=full_vacancy reason=%s",
+                    vacancy_id,
+                    type(ex).__name__,
+                )
+                return vacancy, "needs_review", "full_vacancy_unavailable"
+
+        normalized, reason = normalize_vacancy(enriched)
+        if not normalized:
+            logger.warning(
+                "malformed_vacancy stage=normalize vacancy_id=%s reason=%s",
+                vacancy_id,
+                reason,
+            )
+            return enriched, "malformed", reason
+
+        decision, reason = VacancyEvaluator().evaluate(normalized)
+        logger.info(
+            "vacancy_decision vacancy_id=%s area=%s format=%s decision=%s reason=%s",
+            normalized.id,
+            normalized.area or "unknown",
+            normalized.display_format,
+            decision,
+            reason,
+        )
+        return enriched, decision, reason
+
+    def _needs_vacancy_enrichment(self, vacancy: SearchVacancy) -> bool:
+        missing_required = any(key not in vacancy for key in REQUIRED_VACANCY_FIELDS)
+        if missing_required:
+            return True
+        snippet = vacancy.get("snippet") if isinstance(vacancy.get("snippet"), dict) else {}
+        has_text = bool(
+            vacancy.get("description")
+            or snippet.get("requirement")
+            or snippet.get("responsibility")
+        )
+        return not has_text
 
     def _send_email(self, to: str, subject: str, body: str) -> None:
         cfg = self.tool.config.get("smtp", {})
