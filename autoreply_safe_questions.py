@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
+from hh_applicant_tool import reply_safety
+
 BASE = Path(os.environ.get("HH_BOT_BASE", "/opt/hh-bot"))
 STATE = BASE / "state"
 SEEN_FILE = STATE / "autoreply_safe_seen.json"
@@ -68,7 +70,28 @@ def call_api(args):
         print("API_ERROR:", " ".join(args), (res.stderr or res.stdout)[:500])
     return None
 
-def post_message(nid, msg):
+def post_message(nid, msg, inbound_message_id):
+    msg = str(msg or "").strip()
+    if not msg:
+        print("blocked_empty_message:", nid)
+        reply_safety.mark_claim(nid, inbound_message_id, "blocked_empty_message")
+        return 1, "", "blocked_empty_message"
+    if reply_safety.contains_control_marker(msg):
+        print("blocked_control_marker:", nid)
+        reply_safety.mark_claim(nid, inbound_message_id, "blocked_control_marker")
+        return 1, "", "blocked_control_marker"
+    if reply_safety.is_dry_run():
+        reply_safety.would("WOULD_SEND", nid, inbound_message_id, msg)
+        return 0, "dry-run", ""
+    if not reply_safety.send_enabled():
+        print(f"blocked_send_disabled: {nid} {inbound_message_id}")
+        reply_safety.release_claim(
+            nid,
+            inbound_message_id,
+            "blocked_send_disabled",
+        )
+        return 1, "", "blocked_send_disabled"
+
     res = subprocess.run(
         [TOOL, "call-api", "-m", "POST", f"/negotiations/{nid}/messages", f"message={msg}"],
         text=True,
@@ -79,6 +102,16 @@ def post_message(nid, msg):
 def msg_key(nid, msg):
     mid = msg.get("id") or (msg.get("created_at", "") + ":" + str(abs(hash(msg.get("text") or ""))))
     return f"{nid}:{mid}"
+
+def msg_id(msg):
+    return str(
+        msg.get("id")
+        or (
+            str(msg.get("created_at") or "")
+            + ":"
+            + str(abs(hash(msg.get("text") or "")))
+        )
+    )
 
 def add_review(item):
     data = load_json(REVIEW_FILE, [])
@@ -198,14 +231,20 @@ def main():
 
     for nid, vacancy, employer, _state, last in get_last_messages():
         text = last.get("text") or ""
+        inbound_message_id = msg_id(last)
         k = msg_key(nid, last)
 
         if k in seen:
             skipped += 1
             continue
 
+        if reply_safety.is_terminal(nid, inbound_message_id):
+            skipped += 1
+            continue
+
         if bootstrap:
             seen[k] = {"status": "bootstrapped", "at": datetime.now().isoformat()}
+            reply_safety.mark_seen(nid, inbound_message_id, "bootstrapped")
             boot += 1
             continue
 
@@ -213,6 +252,10 @@ def main():
 
         if NO_REPLY.search(text):
             seen[k] = {"status": "ignored_no_reply", "at": datetime.now().isoformat()}
+            if not reply_safety.is_dry_run():
+                reply_safety.mark_seen(nid, inbound_message_id, "ignored")
+            else:
+                reply_safety.would("WOULD_SKIP", nid, inbound_message_id, text)
             skipped += 1
             continue
 
@@ -225,6 +268,10 @@ def main():
                 "text": text,
             })
             seen[k] = {"status": "review_bad_vacancy", "at": datetime.now().isoformat()}
+            if not reply_safety.is_dry_run():
+                reply_safety.mark_seen(nid, inbound_message_id, "human_flow_pending")
+            else:
+                reply_safety.would("WOULD_ASK", nid, inbound_message_id, text)
             reviewed += 1
             continue
 
@@ -237,6 +284,10 @@ def main():
                 "text": text,
             })
             seen[k] = {"status": "review_external_or_manual", "at": datetime.now().isoformat()}
+            if not reply_safety.is_dry_run():
+                reply_safety.mark_seen(nid, inbound_message_id, "human_flow_pending")
+            else:
+                reply_safety.would("WOULD_ASK", nid, inbound_message_id, text)
             reviewed += 1
             continue
 
@@ -251,21 +302,51 @@ def main():
                 "text": text,
             })
             seen[k] = {"status": "review_unknown", "at": datetime.now().isoformat()}
+            if not reply_safety.is_dry_run():
+                reply_safety.mark_seen(nid, inbound_message_id, "human_flow_pending")
+            else:
+                reply_safety.would("WOULD_ASK", nid, inbound_message_id, text)
             reviewed += 1
             continue
 
-        code, out, err = post_message(nid, msg)
+        if not reply_safety.is_dry_run() and not reply_safety.try_claim(
+            nid,
+            inbound_message_id,
+            "autoreply_safe_questions",
+        ):
+            skipped += 1
+            continue
+
+        code, out, err = post_message(nid, msg, inbound_message_id)
 
         if code == 0:
-            print("AUTO_SENT:", nid, "|", vacancy)
-            seen[k] = {"status": "sent", "at": datetime.now().isoformat(), "answer": msg}
-            sent += 1
+            if reply_safety.is_dry_run():
+                seen[k] = {"status": "dry_run", "at": datetime.now().isoformat(), "answer": msg}
+            else:
+                print("AUTO_SENT:", nid, "|", vacancy)
+                seen[k] = {"status": "sent", "at": datetime.now().isoformat(), "answer": msg}
+                reply_safety.mark_claim(nid, inbound_message_id, "sent")
+                sent += 1
         else:
             print("SEND_ERROR:", nid, "|", vacancy, "|", (err or out)[:500])
             if "disabled_by_employer" in (err + out):
                 seen[k] = {"status": "disabled_by_employer", "at": datetime.now().isoformat()}
+                reply_safety.mark_claim(
+                    nid,
+                    inbound_message_id,
+                    "disabled_by_employer",
+                    error=(err or out)[:500],
+                )
+                skipped += 1
+            elif "blocked_send_disabled" in (err + out):
                 skipped += 1
             else:
+                reply_safety.release_claim(
+                    nid,
+                    inbound_message_id,
+                    "retryable_send_error",
+                    error=(err or out)[:500],
+                )
                 add_review({
                     "negotiation_id": nid,
                     "vacancy": vacancy,
@@ -276,7 +357,8 @@ def main():
                 })
                 reviewed += 1
 
-    save_json(SEEN_FILE, seen)
+    if not reply_safety.is_dry_run():
+        save_json(SEEN_FILE, seen)
     print(f"AUTO_REPLY_SAFE done | sent={sent} reviewed={reviewed} skipped={skipped} bootstrapped={boot}")
 
 if __name__ == "__main__":

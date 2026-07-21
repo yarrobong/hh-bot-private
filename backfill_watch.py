@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, date
 
+from hh_applicant_tool import reply_safety
+
 BASE = Path(os.environ.get("HH_BOT_BASE", "/opt/hh-bot"))
 STATE_DIR = BASE / "state"
 LOG_DIR = BASE / "logs"
@@ -128,6 +130,8 @@ def save_ask_request(item):
             "history": item.get("text") or "",
             "status": "waiting",
             "reason": reason,
+            "inbound_message_id": str(item.get("message_id") or ""),
+            "last_employer_message_id": str(item.get("message_id") or ""),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         },
     )
@@ -282,18 +286,29 @@ for n in data.get("items", []):
         "vacancy": vacancy,
         "employer": norm(((n.get("employer") or {}) or {}).get("name")),
         "created_at": created,
+        "message_id": mid,
         "reason": reason,
         "text": text,
     })
 
-    seen[nid] = mid
-
-SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
-
 if review:
     for item in review:
+        nid = str(item["negotiation_id"])
+        inbound_message_id = str(item.get("message_id") or "")
+        if reply_safety.is_dry_run():
+            reply_safety.would(
+                "WOULD_ASK",
+                nid,
+                inbound_message_id,
+                item.get("text") or "",
+            )
+            continue
+        if not reply_safety.try_claim(nid, inbound_message_id, "backfill_watch"):
+            continue
         append_review(item)
         save_ask_request(item)
+        reply_safety.mark_claim(nid, inbound_message_id, "asked")
+        seen[nid] = inbound_message_id
     msg = f"Найдено старых диалогов для проверки: {len(review)}\n\n"
     for item in review[:5]:
         msg += f"{item['vacancy']}\n{item['reason']}\n{item['text'][:250]}\n\n"
@@ -301,6 +316,9 @@ if review:
     log(f"REVIEW needed={len(review)} ignored={ignored} errors={errors}")
 else:
     log(f"OK no new review ignored={ignored} errors={errors}; existing_review={'yes' if REVIEW_FILE.exists() else 'no'}")
+
+if not reply_safety.is_dry_run():
+    SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
 
 print()
 print("==== REVIEW FILE ====")

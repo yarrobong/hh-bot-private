@@ -4,6 +4,8 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+
+from hh_applicant_tool import reply_safety
 from text_style import humanize_outgoing_text
 
 BASE = Path(os.environ.get("HH_BOT_BASE", "/opt/hh-bot"))
@@ -368,6 +370,12 @@ def main():
         vacancy = ask.get("vacancy") or ""
         ask_text = ask.get("ask_text") or ""
         answer = ans.get("answer") or ""
+        inbound_message_id = (
+            ans.get("inbound_message_id")
+            or ask.get("inbound_message_id")
+            or ask.get("last_employer_message_id")
+            or "-"
+        )
 
         # Уже готовые черновики не перезаписываем
         if status == "drafted" and ans.get("draft_message"):
@@ -407,7 +415,10 @@ def main():
 
         if error:
             ans = make_needs_review(ans, error)
-            save_json(ans_path, ans)
+            if reply_safety.is_dry_run():
+                reply_safety.would("WOULD_ASK", nid, str(inbound_message_id), error)
+            else:
+                save_json(ans_path, ans)
             needs_review += 1
 
             print("NEEDS REVIEW:")
@@ -418,7 +429,15 @@ def main():
 
         if not final:
             ans = make_needs_review(ans, "Не удалось подготовить безопасный ответ.")
-            save_json(ans_path, ans)
+            if reply_safety.is_dry_run():
+                reply_safety.would(
+                    "WOULD_ASK",
+                    nid,
+                    str(inbound_message_id),
+                    ans["draft_error"],
+                )
+            else:
+                save_json(ans_path, ans)
             needs_review += 1
 
             print("NEEDS REVIEW:")
@@ -431,7 +450,15 @@ def main():
 
         if risky_final_message(final):
             ans = make_needs_review(ans, "Черновик содержит рискованное обещание или личные данные. Нужно переписать вручную.")
-            save_json(ans_path, ans)
+            if reply_safety.is_dry_run():
+                reply_safety.would(
+                    "WOULD_ASK",
+                    nid,
+                    str(inbound_message_id),
+                    ans["draft_error"],
+                )
+            else:
+                save_json(ans_path, ans)
             needs_review += 1
 
             print("NEEDS REVIEW:")
@@ -445,9 +472,15 @@ def main():
 
         ans["status"] = "drafted"
         ans["draft_message"] = final
+        if inbound_message_id and inbound_message_id != "-":
+            ans["inbound_message_id"] = str(inbound_message_id)
+            ans["last_employer_message_id"] = str(inbound_message_id)
         ans.pop("draft_error", None)
         ans["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        save_json(ans_path, ans)
+        if reply_safety.is_dry_run():
+            reply_safety.would("WOULD_SEND", nid, str(inbound_message_id), final)
+        else:
+            save_json(ans_path, ans)
         drafted += 1
 
         print("FINAL MESSAGE:")
